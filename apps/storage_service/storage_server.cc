@@ -152,11 +152,19 @@ class RequestContext {
 
 static void DoRequest(RequestContext *ctx, char *read_buf, char *compress_buf)
 {
+  // TODO @girfan
+  if (ctx->header.lba_count < 1)
+    ctx->header.lba_count = 1;
+
   size_t input_length = ctx->header.lba_count * kSectorSize;
+  log_info("storage_read: entering");
+
   ssize_t ret = storage_read(read_buf, ctx->header.lba, ctx->header.lba_count);
   if (unlikely(ret != 0)) {
     log_warn_ratelimited("storage ret: %ld", ret);
     return;
+  } else {
+    log_info("storage_read: exited");
   }
 
   size_t compressed_length;

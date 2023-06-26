@@ -4,6 +4,7 @@
 
 #include <unistd.h>
 
+#include <rte_errno.h>
 #include <rte_ether.h>
 #include <rte_hash.h>
 #include <rte_jhash.h>
@@ -52,15 +53,21 @@ static void dp_clients_add_client(struct proc *p)
 	}
 
 	if (!p->has_directpath) {
-		ret = rte_extmem_register(p->region.base, p->region.len, NULL, 0, PGSIZE_2MB);
+		ret = rte_extmem_register(p->region.base, align_up(p->region.len, PGSIZE_2MB), NULL, 0, PGSIZE_2MB);
 		if (ret < 0) {
 			log_err("dp_clients: failed to register extmem for client");
+      if (rte_errno == EINVAL)
+        log_err("dp_clients: EINVAL");
+      if (rte_errno == ENOSPC)
+        log_err("dp_clients: ENOSPC");
+      if (rte_errno == EEXIST)
+        log_err("dp_clients: EEXIST");
 			goto fail;
 		}
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-		ret = rte_dev_dma_map(dp.device, p->region.base, 0, p->region.len);
+		ret = rte_dev_dma_map(dp.device, p->region.base, 0, align_up(p->region.len, PGSIZE_2MB));
 		if (ret < 0) {
 			log_err("dp_clients: failed to map DMA memory for client");
 			goto fail_extmem;
@@ -74,7 +81,7 @@ static void dp_clients_add_client(struct proc *p)
 	return;
 
 fail_extmem:
-	rte_extmem_unregister(p->region.base, p->region.len);
+	rte_extmem_unregister(p->region.base, align_up(p->region.len, PGSIZE_2MB));
 fail:
 	p->attach_fail = true;
 	dp_clients_remove_client(p);
@@ -122,11 +129,11 @@ static void dp_clients_remove_client(struct proc *p)
 		if (!p->attach_fail) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-			ret = rte_dev_dma_unmap(dp.device, p->region.base, 0, p->region.len);
+			ret = rte_dev_dma_unmap(dp.device, p->region.base, 0, align_up(p->region.len, PGSIZE_2MB));
 			if (ret < 0)
 				log_err("dp_clients: failed to unmap DMA memory for client");
 #pragma GCC diagnostic pop
-			ret = rte_extmem_unregister(p->region.base, p->region.len);
+			ret = rte_extmem_unregister(p->region.base, align_up(p->region.len, PGSIZE_2MB));
 			if (ret < 0)
 				log_err("dp_clients: failed to unregister extmem for client");
 		}

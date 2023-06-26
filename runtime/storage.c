@@ -41,7 +41,7 @@ struct nvme_device {
 	unsigned long latency_us;
 } known_devices[1] = {
 	{
-		.name = "INTEL SSDPED1D280GA",
+		.name = "Dell",
 		.latency_us = 10,
 	}
 };
@@ -60,23 +60,35 @@ static void attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		      struct spdk_nvme_ctrlr *ctrlr,
 		      const struct spdk_nvme_ctrlr_opts *opts)
 {
-	int i, num_ns;
+	int i, num_ns, nsid;
 	const struct spdk_nvme_ctrlr_data *ctrlr_data;
 
 	num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
-	if (num_ns > 1) {
-		perror("more than 1 storage devices");
-		exit(1);
-	}
 	if (num_ns == 0) {
 		perror("no storage device");
 		exit(1);
 	}
 	controller = ctrlr;
 	ctrlr_data = spdk_nvme_ctrlr_get_data(ctrlr);
-	spdk_namespace = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
+
+	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr); nsid != 0;
+	     nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		spdk_namespace = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		if (spdk_namespace == NULL) {
+			continue;
+		} else {
+			log_info("storage: active namespace = %d", nsid);
+			break;
+		}
+	}
+	if (spdk_namespace == NULL) {
+		perror("no active SPDK namespace");
+		exit(1);
+	}
+
 	block_size = spdk_nvme_ns_get_sector_size(spdk_namespace);
 	num_blocks = spdk_nvme_ns_get_num_sectors(spdk_namespace);
+	log_info("storage: sector_size = %d, num_sectors = %ld", block_size, num_blocks);
 
 	for (i = 0; i < ARRAY_SIZE(known_devices); i++) {
 		if (!strncmp((char *)ctrlr_data->mn, known_devices[i].name,
@@ -84,6 +96,8 @@ static void attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 			log_info("storage: recognized device %s", known_devices[i].name);
 			storage_device_latency_us = known_devices[i].latency_us;
 			break;
+		} else {
+			log_err("storage: unrecognized device %s", (char *)ctrlr_data->mn);
 		}
 	}
 
@@ -290,6 +304,8 @@ int storage_init_thread(void)
 
 	/* Allocate CQ of size io_queue_size * sizeof(struct spdk_nvme_cpl) */
 	opts.cq.buffer_size = opts.io_queue_size * sizeof(*cpl);
+	log_info("storage: opts.cq.buffer_size = %ld", opts.cq.buffer_size);
+	log_info("storage: opts.io_queue_size = %d", opts.io_queue_size);
 	cpl = iok_shm_alloc(opts.cq.buffer_size, PGSIZE_4KB, &cq_shm);
 	if (!cpl) {
 		log_err("could not allocate storage CQ buf in shared mem");

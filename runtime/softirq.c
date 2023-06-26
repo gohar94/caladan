@@ -24,7 +24,10 @@ static bool softirq_timer_pending(struct kthread *k, uint64_t now_tsc)
 
 static bool softirq_storage_pending(struct kthread *k)
 {
-	return storage_available_completions(&k->storage_q);
+	const bool av = storage_available_completions(&k->storage_q);
+  if (av)
+    log_info("softirq_storage_pending: true");
+  return av;
 }
 
 /**
