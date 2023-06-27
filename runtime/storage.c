@@ -23,7 +23,7 @@ struct iovec;
 
 #include "defs.h"
 
-unsigned long storage_device_latency_us = 100;
+unsigned long storage_device_latency_us = 10;
 bool cfg_storage_enabled;
 
 static struct spdk_nvme_ctrlr *controller;
@@ -271,7 +271,6 @@ int storage_init_thread(void)
 	struct storage_q *q = &k->storage_q;
 	thread_t *th;
 
-	int ret;
 	uint32_t max_xfer_size, entries, depth, *consumer_idx;
 	shmptr_t cq_shm;
 	struct spdk_nvme_cpl *cpl;

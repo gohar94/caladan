@@ -44,6 +44,12 @@ struct msg_header {
   int tag;
 };
 
+struct log_entry {
+  uint64_t start_tsc;
+  uint64_t end_tsc;
+  bool is_op_write;
+};
+
 /*
  * ReFlex protocol support
  */

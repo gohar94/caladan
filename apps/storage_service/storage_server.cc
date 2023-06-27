@@ -1,5 +1,7 @@
 extern "C" {
+#include <base/atomic.h>
 #include <base/log.h>
+#include <base/time.h>
 #include <runtime/runtime.h>
 #include <runtime/smalloc.h>
 #include <runtime/storage.h>
@@ -18,9 +20,10 @@ extern "C" {
 #include "sync.h"
 #include "thread.h"
 
-#include <snappy.h>
-
+#include <atomic>
+#include <csignal>
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <new>
 
@@ -29,7 +32,54 @@ extern "C" {
 constexpr unsigned int kSectorSize = 512;
 constexpr uint64_t kStorageServicePort = 5000;
 
+constexpr char kLogFilePath[] = "/mydata/storage_server.traces";
+constexpr size_t kLogsMaxBufferEntries = 5 * 1000000;
+
 static unsigned char iv[16];
+
+rt::Mutex logsMutex;
+atomic_t n_logs_buffered;
+static std::vector<log_entry> logs;
+
+/* Flushes the buffered logs into a trace file.
+ *
+ * Note:
+ * This is not thread-safe and must be called with a lock held.
+ */
+void flush_logs() {
+  log_info("Flushing logs...");
+
+  std::ofstream log_file;
+  log_file.open(kLogFilePath, std::fstream::app);
+
+  // Flush to trace file if successfully opened.
+  if (log_file.is_open()) {
+    auto end_cond = atomic_read(&n_logs_buffered);
+    for (int i = 0; i < end_cond; i++) {
+      const auto& l = logs[i];
+      log_file << l.start_tsc << "," << l.end_tsc << "," << l.is_op_write
+               << "\n";
+    }
+    log_info("Traces flushed (%d)...", end_cond);
+    log_file.close();
+  } else {
+    log_err("Cannot open trace file for writing. Skipping...");
+  }
+  atomic_write(&n_logs_buffered, 0);
+
+  // Clear the buffer for collecting more traces.
+  logs.clear();
+  logs.resize(kLogsMaxBufferEntries);
+}
+
+void write_logs_header() {
+  std::ofstream log_file;
+  log_file.open(kLogFilePath, std::fstream::app);
+  if (log_file.is_open()) {
+    log_file << "start_tsc,end_tsc,is_op_write\n";
+    log_file.close();
+  }
+}
 
 class SharedTcpStream {
  public:
@@ -149,37 +199,22 @@ class RequestContext {
   void operator delete(void *p) { sfree(p); }
 };
 
+static void DoRequest(RequestContext *ctx, char *read_buf) {
+  uint64_t start_tsc = microtime();
+  size_t ret = storage_read(read_buf, ctx->header.lba, ctx->header.lba_count);
+  uint64_t end_tsc = microtime();
 
-static void DoRequest(RequestContext *ctx, char *read_buf, char *compress_buf)
-{
-  // TODO @girfan
-  if (ctx->header.lba_count < 1)
-    ctx->header.lba_count = 1;
-
-  size_t input_length = ctx->header.lba_count * kSectorSize;
-  log_info("storage_read: entering");
-
-  ssize_t ret = storage_read(read_buf, ctx->header.lba, ctx->header.lba_count);
   if (unlikely(ret != 0)) {
     log_warn_ratelimited("storage ret: %ld", ret);
     return;
-  } else {
-    log_info("storage_read: exited");
   }
 
-  size_t compressed_length;
-  snappy::RawCompress(read_buf, input_length,
-                      compress_buf, &compressed_length);
-
   rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
-
-  ssize_t encrypt_len = ctx->conn->EncryptStream(compress_buf, align_up(compressed_length, 16), read_buf);
-  if (unlikely(encrypt_len < 0))
-    panic("encrypt");
-
   barrier();
+
+  size_t input_length = ctx->header.lba_count * kSectorSize;
   ctx->header.tsc = rdtsc();
-  ctx->header.lba_count = (size_t)encrypt_len;
+  ctx->header.lba_count = input_length;
   struct iovec response[2] = {
       {
           .iov_base = &ctx->header,
@@ -187,59 +222,79 @@ static void DoRequest(RequestContext *ctx, char *read_buf, char *compress_buf)
       },
       {
           .iov_base = read_buf,
-          .iov_len = (size_t)encrypt_len,
+          .iov_len = input_length,
       },
   };
   ssize_t wret = ctx->conn->WritevFullLocked(response, 2);
-  if (wret != static_cast<ssize_t>(sizeof(ctx->header) + encrypt_len)) {
+  if (wret != static_cast<ssize_t>(sizeof(ctx->header) + input_length)) {
     if (wret != -EPIPE && wret != -ECONNRESET)
       log_err_ratelimited("WritevFull failed: ret = %ld", wret);
   }
-}
 
+  rt::ScopedLock<rt::Mutex> lk(&logsMutex);
+  const size_t idx = (const size_t)atomic_read(&n_logs_buffered);
+  if (unlikely(idx >= kLogsMaxBufferEntries)) {
+    flush_logs();
+  }
+  logs[idx].start_tsc = start_tsc;
+  logs[idx].end_tsc = end_tsc;
+  logs[idx].is_op_write = false;
+  atomic_inc(&n_logs_buffered);
+}
 
 #define ON_STACK_THRESH (32 * KB)
 
 void HandleGetRequestSmall(RequestContext *ctx) {
   size_t input_length = ctx->header.lba_count * kSectorSize;
-  ssize_t max_buf_sz = snappy::MaxCompressedLength(input_length);
-  max_buf_sz = align_up(max_buf_sz + 16, 16);
+  char read_buf[input_length];
 
-  char read_buf[max_buf_sz];
-  char compress_buf[max_buf_sz];
-
-  DoRequest(ctx, read_buf, compress_buf);
+  DoRequest(ctx, read_buf);
 }
 
 void HandleGetRequest(RequestContext *ctx) {
   size_t input_length = ctx->header.lba_count * kSectorSize;
-  ssize_t max_buf_sz = snappy::MaxCompressedLength(input_length);
-  max_buf_sz = align_up(max_buf_sz + 16, 16);
+  char *read_buf;
+  read_buf = allocate_buf(input_length);
 
-  char *read_buf, *compress_buf;
-  read_buf = allocate_buf(max_buf_sz);
-  compress_buf = allocate_buf(max_buf_sz);
+  DoRequest(ctx, read_buf);
 
-  DoRequest(ctx, read_buf, compress_buf);
-
-
-  free_buf(read_buf, max_buf_sz);
-  free_buf(compress_buf, max_buf_sz);
-
+  free_buf(read_buf, input_length);
 }
 
 void HandleSetRequest(RequestContext *ctx) {
+  uint64_t start_tsc = microtime();
   ssize_t ret = storage_write(ctx->buf, ctx->header.lba, ctx->header.lba_count);
+  uint64_t end_tsc = microtime();
+
   if (unlikely(ret != 0)) {
     log_warn("bad set: rc %ld", ret);
   }
-  return;
+
+  rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
+  barrier();
 
   ctx->header.tsc = rdtsc();
-  ret = ctx->conn->WriteFull(&ctx->header, sizeof(ctx->header));
-  if (ret != static_cast<ssize_t>(sizeof(ctx->header))) {
-    if (ret != -EPIPE && ret != -ECONNRESET) log_err("tcp_write failed");
+  struct iovec response[1] = {
+      {
+          .iov_base = &ctx->header,
+          .iov_len = sizeof(ctx->header),
+      },
+  };
+  ssize_t wret = ctx->conn->WritevFullLocked(response, 1);
+  if (wret != static_cast<ssize_t>(sizeof(ctx->header))) {
+    if (wret != -EPIPE && wret != -ECONNRESET)
+      log_err_ratelimited("WritevFull failed: ret = %ld", wret);
   }
+
+  rt::ScopedLock<rt::Mutex> lk(&logsMutex);
+  const size_t idx = (const size_t)atomic_read(&n_logs_buffered);
+  if (unlikely(idx >= kLogsMaxBufferEntries)) {
+    flush_logs();
+  }
+  logs[idx].start_tsc = start_tsc;
+  logs[idx].end_tsc = end_tsc;
+  logs[idx].is_op_write = true;
+  atomic_inc(&n_logs_buffered);
 }
 
 void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
@@ -300,9 +355,20 @@ void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
   }
 }
 
+void signal_handler(int signal) {
+  flush_logs();
+  exit(0);
+}
+
 void MainHandler(void *arg) {
   if (kSectorSize != storage_block_size())
     panic("storage not enabled");
+
+  atomic_write(&n_logs_buffered, 0);
+  logs.resize(kLogsMaxBufferEntries);
+  std::signal(SIGINT, signal_handler);
+  std::remove(kLogFilePath);
+  write_logs_header();
 
   std::unique_ptr<rt::TcpQueue> q(
       rt::TcpQueue::Listen({0, kStorageServicePort}, 4096));
