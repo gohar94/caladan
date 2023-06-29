@@ -19,7 +19,7 @@ const REFLEX_HDR_SZ: usize = 32;
 const REFLEX_MAGIC: u16 = REFLEX_HDR_SZ as u16;
 
 // FIXME - these may be specific to our device
-const NUM_SECTORS: u64 = 547002288;
+const NUM_SECTORS: u64 = 3125627568;
 const LBA_ALIGNMENT: u64 = !0x7;
 const SECTOR_SIZE: usize = 512;
 
@@ -134,7 +134,7 @@ impl ReflexProtocol {
             Arg::with_name("request_size")
                 .long("request_size")
                 .takes_value(true)
-                .default_value("8")
+                .default_value("1")
                 .help("Reflex: request size in sectors"),
         ]
     }

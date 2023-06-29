@@ -1143,7 +1143,7 @@ fn main() {
                 .short("r")
                 .long("runtime")
                 .takes_value(true)
-                .default_value("10")
+                .default_value("3")
                 .help("How long the application should run for"),
         )
         .arg(
