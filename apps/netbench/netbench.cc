@@ -27,19 +27,29 @@ extern "C" {
 namespace {
 
 using namespace std::chrono;
+// TODO girfan: Rename this to microsec.
 using sec = duration<double, std::micro>;
 
 // <- ARGUMENTS FOR EXPERIMENT ->
 // the number of worker threads to spawn.
 int threads;
-// the remote UDP address of the server.
-netaddr raddr;
+// the remote TCP addresses of the servers.
+std::vector<netaddr> servers;
+// target packets per second.
+double max_rps;
+// percentage of write requests.
+double write_pct;
+// number of samples to increment in until target packets/second is achieved.
+int samples;
 // number of iterations required for 1us on target server.
 constexpr uint64_t kIterationsPerUS = 65;
 // Number of seconds to warmup at rate 0.
 constexpr uint64_t kWarmupUpSeconds = 5;
 // Server port to connect to.
 constexpr uint64_t kNetbenchPort = 8001;
+
+// Number of bytes in a page.
+constexpr uint64_t PAGE_SIZE = 4096; // 4K page
 
 constexpr uint64_t kUptimePort = 8002;
 constexpr uint64_t kUptimeMagic = 0xDEADBEEF;
@@ -52,7 +62,7 @@ const uint16_t REFLEX_MAGIC = 32;
 
 // FIXME - these may be specific to our device
 const uint64_t NUM_SECTORS = 3125627568;
-const uint64_t LBA_ALIGNMENT = !0x7;
+const uint64_t LBA_ALIGNMENT = ~(0x7);
 const uint64_t SECTOR_SIZE = 512;
 const uint32_t LBA_COUNT = 8;
 
@@ -61,6 +71,8 @@ const uint16_t OPCODE_SET = 0x01;
 
 const uint16_t RESPONSE_NO_ERROR = 0x00;
 const uint16_t RESPONSE_INV_ARG = 0x04;
+
+std::vector<std::byte> writeReqData;
 
 typedef struct __attribute__((__packed__)) {
   uint16_t magic;
@@ -84,16 +96,23 @@ void PrintPacketHeader(const PacketHeader* p) {
 }
 
 struct work_unit {
+  bool is_op_write;
   double start_us, work_us, duration_us;
   uint64_t tsc;
 };
 
 template <class Arrival>
 std::vector<work_unit> GenerateWork(Arrival a, double cur_us, double last_us) {
+  std::random_device dev;
+  std::mt19937 rng(dev());
+  std::uniform_int_distribution<std::mt19937::result_type> rnd(0, 100);
+
   std::vector<work_unit> w;
   while (cur_us < last_us) {
     cur_us += a();
-    w.emplace_back(work_unit{cur_us, 0, 0});
+    const auto pct = rnd(rng);
+    const bool is_op_write = pct <= write_pct;
+    w.emplace_back(work_unit{is_op_write, cur_us, 0, 0});
   }
   return w;
 }
@@ -127,7 +146,7 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
         panic("magic does not match, received magic = %d", rp.magic);
       }
 
-      PrintPacketHeader(&rp);
+      // PrintPacketHeader(&rp);
 
       if (rp.opcode == OPCODE_GET) {
         // Read the payload if this was a GET request.
@@ -144,7 +163,6 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
       auto ts = steady_clock::now();
       barrier();
       uint64_t idx = rp.req_handle;
-      std::cout << "w.size() = " << w.size() << ", idx = " << idx << "\n";
       w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
       w[idx].tsc = ntoh64(rp.tsc);
     }
@@ -158,22 +176,22 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
   auto expstart = steady_clock::now();
   barrier();
 
+  PacketHeader p;
+
   auto wsize = w.size();
   for (unsigned int i = 0; i < wsize; ++i) {
-    auto lba = rnd(rng);
+    uint64_t lba = (rnd(rng) % NUM_SECTORS) & LBA_ALIGNMENT;
     auto lba_count = LBA_COUNT;
     if (lba + LBA_COUNT > NUM_SECTORS) {
       lba_count = NUM_SECTORS - lba;
     }
 
-    PacketHeader p = {
-      .magic = REFLEX_MAGIC,
-      .opcode = OPCODE_GET,
-      .req_handle = static_cast<uint64_t>(i),
-      .lba = lba,
-      .lba_count = lba_count,
-      .tsc = 0,
-    };
+    p.magic = REFLEX_MAGIC;
+    p.opcode = w[i].is_op_write ? OPCODE_SET : OPCODE_GET;
+    p.req_handle = static_cast<uint64_t>(i);
+    p.lba = lba;
+    p.lba_count = lba_count;
+    p.tsc = 0;
 
     barrier();
     auto now = steady_clock::now();
@@ -183,6 +201,11 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
       ssize_t ret = c->WriteFull(&p, sizeof(PacketHeader));
       if (ret != static_cast<ssize_t>(sizeof(PacketHeader)))
         panic("write failed, ret = %ld", ret);
+      if (w[i].is_op_write) {
+        ret = c->WriteFull(writeReqData.data(), lba_count * SECTOR_SIZE);
+        if (ret != static_cast<ssize_t>(lba_count * SECTOR_SIZE))
+          panic("write failed, ret = %ld", ret);
+      }
       now = steady_clock::now();
       rt::Sleep(w[i].start_us - duration_cast<sec>(now - expstart).count());
     }
@@ -195,7 +218,7 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
     barrier();
   }
 
-  // rt::Sleep(1 * rt::kSeconds);
+  rt::Sleep(1 * rt::kSeconds);
   c->Shutdown(SHUT_RDWR);
   th.Join();
 
@@ -203,11 +226,13 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
 }
 
 std::vector<work_unit> RunExperiment(
-    int threads, double *reqs_per_sec,
-    std::function<std::vector<work_unit>()> wf) {
+    int threads, double *rps, std::function<std::vector<work_unit>()> wf) {
   // Create one TCP connection per thread.
   std::vector<std::unique_ptr<rt::TcpConn>> conns;
+  const auto num_servers = servers.size();
   for (int i = 0; i < threads; ++i) {
+    // Assign threads to servers in a round robin fashion.
+    const netaddr raddr = servers[i % num_servers];
     std::unique_ptr<rt::TcpConn> outc(rt::TcpConn::Dial({0, 0}, raddr));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
     conns.emplace_back(std::move(outc));
@@ -257,8 +282,8 @@ std::vector<work_unit> RunExperiment(
           w.end());
 
   double elapsed = duration_cast<sec>(finish - start).count();
-  if (reqs_per_sec != nullptr)
-    *reqs_per_sec = static_cast<double>(w.size()) / elapsed * 1000000;
+  if (rps != nullptr)
+    *rps = static_cast<double>(w.size()) / elapsed * 1000000;
 
   return w;
 }
@@ -288,7 +313,7 @@ void PrintStatResults(std::vector<work_unit> w, double offered_rps,
       << max << std::endl;
 }
 
-void SteadyStateExperiment(int threads, double offered_rps) {
+void SteadyStateExperiment(double offered_rps) {
   double rps;
   std::vector<work_unit> w = RunExperiment(threads, &rps, [=] {
     std::mt19937 rg(rand());
@@ -302,8 +327,9 @@ void SteadyStateExperiment(int threads, double offered_rps) {
 }
 
 void ClientHandler(void *arg) {
-  for (double i = 100; i < 1000; i += 100) {
-    SteadyStateExperiment(threads, i);
+  const double step_size = max_rps / samples;
+  for (double i = step_size; i <= max_rps; i += step_size) {
+    SteadyStateExperiment(i);
   }
 }
 
@@ -314,31 +340,41 @@ int StringToAddr(const char *str, uint32_t *addr) {
   return 0;
 }
 
+void FillWriteRequestData() {
+  writeReqData.resize(LBA_COUNT * SECTOR_SIZE);
+  for (uint64_t i = 0; i < writeReqData.size(); i++) {
+    if (i % 2)
+      writeReqData[i] = std::byte(0xa);
+    else
+      writeReqData[i] = std::byte(0xb);
+  }
+}
+
 }  // anonymous namespace
 
 int main(int argc, char *argv[]) {
   int ret;
 
-  if (argc < 3) {
-    std::cerr << "usage: [cfg_file] [cmd] ..." << std::endl;
+  if (argc < 7) {
+    std::cerr << "usage: [cfg_file] [nthreads] [mpps] [samples] [write_pct %] "
+                 "[<ip> <ip> ...]\n";
     return -EINVAL;
   }
 
-  std::string cmd = argv[2];
-  if (cmd.compare("client") != 0) {
-    std::cerr << "invalid command: " << cmd << std::endl;
-    return -EINVAL;
+  threads = std::stoi(argv[2], nullptr, 0);
+  max_rps = std::stod(argv[3]) * 1000000; // MPPS to RPS
+  samples = std::stoi(argv[4]);
+  write_pct = std::stod(argv[5]);
+
+  for (int i = 6; i < argc; i++) {
+    netaddr raddr;
+    ret = StringToAddr(argv[i], &raddr.ip);
+    if (ret) return -EINVAL;
+    raddr.port = kNetbenchPort;
+    servers.emplace_back(raddr);
   }
 
-  if (argc < 5) {
-    std::cerr << "usage: [cfg_file] client [#threads] [remote_ip]\n";
-    return -EINVAL;
-  }
-
-  threads = std::stoi(argv[3], nullptr, 0);
-  ret = StringToAddr(argv[4], &raddr.ip);
-  if (ret) return -EINVAL;
-  raddr.port = kNetbenchPort;
+  FillWriteRequestData();
 
   ret = runtime_init(argv[1], ClientHandler, NULL);
   if (ret) {
