@@ -117,7 +117,9 @@ std::vector<work_unit> GenerateWork(Arrival a, double cur_us, double last_us) {
   return w;
 }
 
-std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
+std::vector<work_unit> ClientWorker(
+    const std::vector<std::unique_ptr<rt::TcpConn>> &conns,
+    rt::WaitGroup *starter,
     std::function<std::vector<work_unit>()> wf) {
   std::vector<work_unit> w(wf());
   std::vector<time_point<steady_clock>> timings;
@@ -127,46 +129,49 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
   std::mt19937 rng(dev());
   std::uniform_int_distribution<std::mt19937::result_type> rnd(0, NUM_SECTORS);
 
-  // Start the receiver thread.
-  auto th = rt::Thread([&] {
-    PacketHeader rp;
-
-    while (true) {
-      // Read the packet header.
-      ssize_t ret = c->ReadFull(&rp, sizeof(rp));
-      if (ret != static_cast<ssize_t>(sizeof(rp))) {
-        if (ret == 0 || ret < 0) break;
-        panic("read failed, ret = %ld", ret);
-      }
-
-      // Verify the magic.
-      // TODO girfan: This is probably a bad approach; should read magic first.
-      // Only if magic matches should we read the rest of the payload.
-      if (rp.magic != REFLEX_MAGIC) {
-        panic("magic does not match, received magic = %d", rp.magic);
-      }
-
-      // PrintPacketHeader(&rp);
-
-      if (rp.opcode == OPCODE_GET) {
-        // Read the payload if this was a GET request.
-        const size_t payload_size = rp.lba_count * SECTOR_SIZE;
-        void* buf = malloc(payload_size);
-        ssize_t ret = c->ReadFull(buf, payload_size);
-        if (ret != static_cast<ssize_t>(payload_size)) {
+  // Start the receiver threads.
+  std::vector<rt::Thread> th;
+  for (size_t i = 0; i < conns.size(); i++) {
+    rt::TcpConn * c = conns[i].get();
+    th.emplace_back(rt::Thread([&, c] {
+      PacketHeader rp;
+      while (true) {
+        // Read the packet header.
+        ssize_t ret = c->ReadFull(&rp, sizeof(rp));
+        if (ret != static_cast<ssize_t>(sizeof(rp))) {
           if (ret == 0 || ret < 0) break;
           panic("read failed, ret = %ld", ret);
         }
-      }
 
-      barrier();
-      auto ts = steady_clock::now();
-      barrier();
-      uint64_t idx = rp.req_handle;
-      w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
-      w[idx].tsc = ntoh64(rp.tsc);
-    }
-  });
+        // Verify the magic.
+        // TODO girfan: This is probably a bad approach; should read magic first.
+        // Only if magic matches should we read the rest of the payload.
+        if (rp.magic != REFLEX_MAGIC) {
+          panic("magic does not match, received magic = %d", rp.magic);
+        }
+
+        // PrintPacketHeader(&rp);
+
+        if (rp.opcode == OPCODE_GET) {
+          // Read the payload if this was a GET request.
+          const size_t payload_size = rp.lba_count * SECTOR_SIZE;
+          void* buf = malloc(payload_size);
+          ssize_t ret = c->ReadFull(buf, payload_size);
+          if (ret != static_cast<ssize_t>(payload_size)) {
+            if (ret == 0 || ret < 0) break;
+            panic("read failed, ret = %ld", ret);
+          }
+        }
+
+        barrier();
+        auto ts = steady_clock::now();
+        barrier();
+        uint64_t idx = rp.req_handle;
+        w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
+        w[idx].tsc = ntoh64(rp.tsc);
+      }
+    }));
+  }
 
   // Synchronized start of load generation.
   starter->Done();
@@ -197,6 +202,15 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
     auto now = steady_clock::now();
     barrier();
 
+    // TODO girfan: This is assuming only two connections
+    rt::TcpConn *c;
+    if (w[i].is_op_write) {
+    // if (i % 2) {
+      c = conns[0].get();
+    } else {
+      c = conns[1].get();
+    }
+
     if (duration_cast<sec>(now - expstart).count() < w[i].start_us) {
       ssize_t ret = c->WriteFull(&p, sizeof(PacketHeader));
       if (ret != static_cast<ssize_t>(sizeof(PacketHeader)))
@@ -219,23 +233,27 @@ std::vector<work_unit> ClientWorker(rt::TcpConn *c, rt::WaitGroup *starter,
   }
 
   rt::Sleep(1 * rt::kSeconds);
-  c->Shutdown(SHUT_RDWR);
-  th.Join();
+
+  for (auto &c : conns) c->Shutdown(SHUT_RDWR);
+  for (auto &t : th) t.Join();
 
   return w;
 }
 
 std::vector<work_unit> RunExperiment(
     int threads, double *rps, std::function<std::vector<work_unit>()> wf) {
-  // Create one TCP connection per thread.
-  std::vector<std::unique_ptr<rt::TcpConn>> conns;
   const auto num_servers = servers.size();
-  for (int i = 0; i < threads; ++i) {
-    // Assign threads to servers in a round robin fashion.
-    const netaddr raddr = servers[i % num_servers];
-    std::unique_ptr<rt::TcpConn> outc(rt::TcpConn::Dial({0, 0}, raddr));
-    if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
-    conns.emplace_back(std::move(outc));
+  // Create one TCP connection per thread-server pair.
+  std::vector<std::vector<std::unique_ptr<rt::TcpConn>>> thread_conns(threads);
+  for (int i = 0; i < threads; i++) {
+    thread_conns[i].resize(num_servers);
+    for (size_t j = 0; j < num_servers; j++) {
+      // Assign threads to servers in a round robin fashion.
+      const netaddr raddr = servers[j];
+      std::unique_ptr<rt::TcpConn> outc(rt::TcpConn::Dial({0, 0}, raddr));
+      if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
+      thread_conns[i][j] = std::move(outc);
+    }
   }
 
   // Launch a worker thread for each connection.
@@ -244,7 +262,7 @@ std::vector<work_unit> RunExperiment(
   std::unique_ptr<std::vector<work_unit>> samples[threads];
   for (int i = 0; i < threads; ++i) {
     th.emplace_back(rt::Thread([&, i] {
-      auto v = ClientWorker(conns[i].get(), &starter, wf);
+      auto v = ClientWorker(thread_conns[i], &starter, wf);
       samples[i].reset(new std::vector<work_unit>(std::move(v)));
     }));
   }
@@ -267,7 +285,11 @@ std::vector<work_unit> RunExperiment(
   barrier();
 
   // Close the connections.
-  for (auto &c : conns) c->Abort();
+  for (auto &conns : thread_conns) {
+    for (auto &c : conns) {
+      c->Abort();
+    }
+  }
 
   // Aggregate all the samples together.
   std::vector<work_unit> w;
