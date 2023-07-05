@@ -265,9 +265,15 @@ void HandleSetRequest(RequestContext *ctx) {
   uint64_t start_tsc = microtime();
   ssize_t ret = storage_write(ctx->buf, ctx->header.lba, ctx->header.lba_count);
   uint64_t end_tsc = microtime();
+  std::cout << ctx->header.lba << "," << ctx->header.lba_count << "\n";
 
   if (unlikely(ret != 0)) {
-    log_warn("bad set: rc %ld", ret);
+    if (ret == -EIO)
+	    log_warn("bad set EIO: rc %ld", ret);
+    if (ret == -ENOMEM)
+	    log_warn("bad set ENOMEM: rc %ld", ret);
+    if (ret == -ENODEV)
+	    log_warn("bad set ENODEV: rc %ld", ret);
   }
 
   rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);

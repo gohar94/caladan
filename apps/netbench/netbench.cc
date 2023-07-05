@@ -46,7 +46,7 @@ constexpr uint64_t kIterationsPerUS = 65;
 // Number of seconds to warmup at rate 0.
 constexpr uint64_t kWarmupUpSeconds = 5;
 // Server port to connect to.
-constexpr uint64_t kNetbenchPort = 8001;
+constexpr uint64_t kNetbenchPort = 5000;
 
 // Number of bytes in a page.
 constexpr uint64_t PAGE_SIZE = 4096; // 4K page
@@ -204,18 +204,22 @@ std::vector<work_unit> ClientWorker(
 
     // TODO girfan: This is assuming only two connections
     rt::TcpConn *c;
+    /*
     if (w[i].is_op_write) {
     // if (i % 2) {
       c = conns[0].get();
     } else {
       c = conns[1].get();
     }
+    */
+    c = conns[0].get();
 
     if (duration_cast<sec>(now - expstart).count() < w[i].start_us) {
       ssize_t ret = c->WriteFull(&p, sizeof(PacketHeader));
       if (ret != static_cast<ssize_t>(sizeof(PacketHeader)))
         panic("write failed, ret = %ld", ret);
       if (w[i].is_op_write) {
+	std::cout << "writing: " << lba_count * SECTOR_SIZE << "\n";
         ret = c->WriteFull(writeReqData.data(), lba_count * SECTOR_SIZE);
         if (ret != static_cast<ssize_t>(lba_count * SECTOR_SIZE))
           panic("write failed, ret = %ld", ret);
