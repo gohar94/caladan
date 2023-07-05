@@ -38,7 +38,7 @@ constexpr size_t kLogsMaxBufferEntries = 5 * 1000000;
 static unsigned char iv[16];
 
 rt::Mutex logsMutex;
-atomic_t n_logs_buffered;
+size_t logs_idx = 0;
 static std::vector<log_entry> logs;
 
 /* Flushes the buffered logs into a trace file.
@@ -54,18 +54,17 @@ void flush_logs() {
 
   // Flush to trace file if successfully opened.
   if (log_file.is_open()) {
-    auto end_cond = atomic_read(&n_logs_buffered);
-    for (int i = 0; i < end_cond; i++) {
+    for (size_t i = 0; i < logs_idx; i++) {
       const auto& l = logs[i];
       log_file << l.start_tsc << "," << l.end_tsc << "," << l.is_op_write
                << "\n";
     }
-    log_info("Traces flushed (%d)...", end_cond);
+    log_info("Traces flushed (%ld)...", logs_idx);
     log_file.close();
   } else {
     log_err("Cannot open trace file for writing. Skipping...");
   }
-  atomic_write(&n_logs_buffered, 0);
+  logs_idx = 0;
 
   // Clear the buffer for collecting more traces.
   logs.clear();
@@ -199,7 +198,7 @@ class RequestContext {
   void operator delete(void *p) { sfree(p); }
 };
 
-static void DoRequest(RequestContext *ctx, char *read_buf) {
+static void DoRequest(RequestContext *ctx, char *read_buf, const size_t idx) {
   uint64_t start_tsc = microtime();
   size_t ret = storage_read(read_buf, ctx->header.lba, ctx->header.lba_count);
   uint64_t end_tsc = microtime();
@@ -212,9 +211,8 @@ static void DoRequest(RequestContext *ctx, char *read_buf) {
   rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
   barrier();
 
-  size_t input_length = ctx->header.lba_count * kSectorSize;
+  size_t buf_length = ctx->header.lba_count * kSectorSize;
   ctx->header.tsc = rdtsc();
-  ctx->header.lba_count = input_length;
   struct iovec response[2] = {
       {
           .iov_base = &ctx->header,
@@ -222,58 +220,46 @@ static void DoRequest(RequestContext *ctx, char *read_buf) {
       },
       {
           .iov_base = read_buf,
-          .iov_len = input_length,
+          .iov_len = buf_length,
       },
   };
   ssize_t wret = ctx->conn->WritevFullLocked(response, 2);
-  if (wret != static_cast<ssize_t>(sizeof(ctx->header) + input_length)) {
+  if (wret != static_cast<ssize_t>(sizeof(ctx->header) + buf_length)) {
     if (wret != -EPIPE && wret != -ECONNRESET)
       log_err_ratelimited("WritevFull failed: ret = %ld", wret);
   }
 
-  rt::ScopedLock<rt::Mutex> lk(&logsMutex);
-  const size_t idx = (const size_t)atomic_read(&n_logs_buffered);
-  if (unlikely(idx >= kLogsMaxBufferEntries)) {
-    flush_logs();
-  }
   logs[idx].start_tsc = start_tsc;
   logs[idx].end_tsc = end_tsc;
   logs[idx].is_op_write = false;
-  atomic_inc(&n_logs_buffered);
 }
 
 #define ON_STACK_THRESH (32 * KB)
 
-void HandleGetRequestSmall(RequestContext *ctx) {
+void HandleGetRequestSmall(RequestContext *ctx, const size_t idx) {
   size_t input_length = ctx->header.lba_count * kSectorSize;
   char read_buf[input_length];
 
-  DoRequest(ctx, read_buf);
+  DoRequest(ctx, read_buf, idx);
 }
 
-void HandleGetRequest(RequestContext *ctx) {
+void HandleGetRequest(RequestContext *ctx, const size_t idx) {
   size_t input_length = ctx->header.lba_count * kSectorSize;
   char *read_buf;
   read_buf = allocate_buf(input_length);
 
-  DoRequest(ctx, read_buf);
+  DoRequest(ctx, read_buf, idx);
 
   free_buf(read_buf, input_length);
 }
 
-void HandleSetRequest(RequestContext *ctx) {
+void HandleSetRequest(RequestContext *ctx, const size_t idx) {
   uint64_t start_tsc = microtime();
   ssize_t ret = storage_write(ctx->buf, ctx->header.lba, ctx->header.lba_count);
   uint64_t end_tsc = microtime();
-  std::cout << ctx->header.lba << "," << ctx->header.lba_count << "\n";
 
   if (unlikely(ret != 0)) {
-    if (ret == -EIO)
-	    log_warn("bad set EIO: rc %ld", ret);
-    if (ret == -ENOMEM)
-	    log_warn("bad set ENOMEM: rc %ld", ret);
-    if (ret == -ENODEV)
-	    log_warn("bad set ENODEV: rc %ld", ret);
+    log_warn("bad set: rc %ld", ret);
   }
 
   rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
@@ -292,15 +278,9 @@ void HandleSetRequest(RequestContext *ctx) {
       log_err_ratelimited("WritevFull failed: ret = %ld", wret);
   }
 
-  rt::ScopedLock<rt::Mutex> lk(&logsMutex);
-  const size_t idx = (const size_t)atomic_read(&n_logs_buffered);
-  if (unlikely(idx >= kLogsMaxBufferEntries)) {
-    flush_logs();
-  }
   logs[idx].start_tsc = start_tsc;
   logs[idx].end_tsc = end_tsc;
   logs[idx].is_op_write = true;
-  atomic_inc(&n_logs_buffered);
 }
 
 void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
@@ -312,7 +292,6 @@ void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
 
     /* Receive a work request. */
     ssize_t ret = c->ReadFull(h, sizeof(*h));
-    // log_err("read ret %ld", ret);
     if (ret != static_cast<ssize_t>(sizeof(*h))) {
       if (ret != 0 && ret != -ECONNRESET)
         log_err("read failed, ret = %ld", ret);
@@ -342,7 +321,7 @@ void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
         return;
       }
       rt::Thread([=] {
-        HandleSetRequest(ctx);
+        HandleSetRequest(ctx, logs_idx);
         delete ctx;
       })
           .Detach();
@@ -350,14 +329,16 @@ void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
       rt::Thread([=] {
         size_t payload_size = ctx->header.lba_count * kSectorSize;
         if (payload_size > ON_STACK_THRESH) {
-          HandleGetRequest(ctx);
+          HandleGetRequest(ctx, logs_idx);
         } else {
-          HandleGetRequestSmall(ctx);
+          HandleGetRequestSmall(ctx, logs_idx);
         }
         delete ctx;
       })
           .Detach();
     }
+
+    logs_idx++;
   }
 }
 
@@ -370,7 +351,6 @@ void MainHandler(void *arg) {
   if (kSectorSize != storage_block_size())
     panic("storage not enabled");
 
-  atomic_write(&n_logs_buffered, 0);
   logs.resize(kLogsMaxBufferEntries);
   std::signal(SIGINT, signal_handler);
   std::remove(kLogFilePath);

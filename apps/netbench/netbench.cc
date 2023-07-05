@@ -1,5 +1,6 @@
 extern "C" {
 #include <base/log.h>
+#include <base/time.h>
 #include <net/ip.h>
 #include <unistd.h>
 }
@@ -83,9 +84,13 @@ typedef struct __attribute__((__packed__)) {
   uint64_t tsc;
 } PacketHeader;
 
+constexpr char kLogFilePath[] = "/mydata/netbench.traces";
+constexpr size_t kLogsMaxBufferEntries = 5 * 1000000;
+
 // The maximum lateness to tolerate before dropping egress samples.
 constexpr uint64_t kMaxCatchUpUS = 5;
 
+#ifdef DEBUG
 void PrintPacketHeader(const PacketHeader* p) {
   std::cout << "magic: " << p->magic
             << ", opcode: " << p->opcode
@@ -94,12 +99,52 @@ void PrintPacketHeader(const PacketHeader* p) {
             << ", lba_count: " << p->lba_count
             << ", tsc: " << p->tsc << "\n";
 }
+#endif
 
 struct work_unit {
   bool is_op_write;
   double start_us, work_us, duration_us;
-  uint64_t tsc;
+  uint64_t start_tsc, end_tsc, tsc;
 };
+
+/* Flushes the buffered logs into a trace file.
+ *
+ * Note:
+ * This is not thread-safe and must be called with a lock held.
+ */
+void flush_logs(const std::vector<work_unit> work_units) {
+  std::cout << "Flushing traces...\n";
+
+  std::ofstream log_file;
+  log_file.open(kLogFilePath, std::fstream::app);
+
+  // Flush to trace file if successfully opened.
+  if (log_file.is_open()) {
+    size_t flush_count = 0;
+    for (const auto& w : work_units) {
+      if (w.duration_us == 0) {
+  // Skip requests that did not complete.
+  continue;
+      }
+      log_file << w.start_tsc << "," << w.end_tsc << "," << w.is_op_write
+               << "\n";
+      flush_count++;
+    }
+    std::cout << "Traces flushed (" << flush_count << ")...\n";
+    log_file.close();
+  } else {
+    std::cerr << "Cannot open trace file for writing. Skipping...\n";
+  }
+}
+
+void write_logs_header() {
+  std::ofstream log_file;
+  log_file.open(kLogFilePath, std::fstream::app);
+  if (log_file.is_open()) {
+    log_file << "start_tsc,end_tsc,is_op_write\n";
+    log_file.close();
+  }
+}
 
 template <class Arrival>
 std::vector<work_unit> GenerateWork(Arrival a, double cur_us, double last_us) {
@@ -125,6 +170,7 @@ std::vector<work_unit> ClientWorker(
   std::vector<time_point<steady_clock>> timings;
   timings.reserve(w.size());
 
+  // Random number generator for picking an LBA.
   std::random_device dev;
   std::mt19937 rng(dev());
   std::uniform_int_distribution<std::mt19937::result_type> rnd(0, NUM_SECTORS);
@@ -148,9 +194,11 @@ std::vector<work_unit> ClientWorker(
         // Only if magic matches should we read the rest of the payload.
         if (rp.magic != REFLEX_MAGIC) {
           panic("magic does not match, received magic = %d", rp.magic);
-        }
+  }
 
-        // PrintPacketHeader(&rp);
+#ifdef DEBUG
+        PrintPacketHeader(&rp);
+#endif
 
         if (rp.opcode == OPCODE_GET) {
           // Read the payload if this was a GET request.
@@ -164,11 +212,13 @@ std::vector<work_unit> ClientWorker(
         }
 
         barrier();
+        auto end_tsc = rdtsc();
         auto ts = steady_clock::now();
         barrier();
         uint64_t idx = rp.req_handle;
         w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
         w[idx].tsc = ntoh64(rp.tsc);
+        w[idx].end_tsc = end_tsc;
       }
     }));
   }
@@ -182,10 +232,14 @@ std::vector<work_unit> ClientWorker(
   barrier();
 
   PacketHeader p;
-
   auto wsize = w.size();
+
+  // TODO girfan: round-robin
+  // size_t server_idx = 0;
+
   for (unsigned int i = 0; i < wsize; ++i) {
-    uint64_t lba = (rnd(rng) % NUM_SECTORS) & LBA_ALIGNMENT;
+    const uint64_t sector = (rnd(rng) % NUM_SECTORS);
+    uint64_t lba = sector & LBA_ALIGNMENT;
     auto lba_count = LBA_COUNT;
     if (lba + LBA_COUNT > NUM_SECTORS) {
       lba_count = NUM_SECTORS - lba;
@@ -197,29 +251,23 @@ std::vector<work_unit> ClientWorker(
     p.lba = lba;
     p.lba_count = lba_count;
     p.tsc = 0;
-
+    
     barrier();
     auto now = steady_clock::now();
     barrier();
 
-    // TODO girfan: This is assuming only two connections
-    rt::TcpConn *c;
-    /*
-    if (w[i].is_op_write) {
-    // if (i % 2) {
-      c = conns[0].get();
-    } else {
-      c = conns[1].get();
-    }
-    */
-    c = conns[0].get();
+    // TODO girfan: round-robin
+    // rt::TcpConn *c = conns[server_idx].get();
+
+    // TODO girfan: lba striping across servers
+    rt::TcpConn *c = conns[sector % conns.size()].get();
 
     if (duration_cast<sec>(now - expstart).count() < w[i].start_us) {
+      w[i].start_tsc = rdtsc();
       ssize_t ret = c->WriteFull(&p, sizeof(PacketHeader));
       if (ret != static_cast<ssize_t>(sizeof(PacketHeader)))
         panic("write failed, ret = %ld", ret);
       if (w[i].is_op_write) {
-	std::cout << "writing: " << lba_count * SECTOR_SIZE << "\n";
         ret = c->WriteFull(writeReqData.data(), lba_count * SECTOR_SIZE);
         if (ret != static_cast<ssize_t>(lba_count * SECTOR_SIZE))
           panic("write failed, ret = %ld", ret);
@@ -234,6 +282,9 @@ std::vector<work_unit> ClientWorker(
     barrier();
     timings[i] = steady_clock::now();
     barrier();
+
+    // TODO girfan: round-robin
+    // server_idx = (server_idx + 1) % conns.size();
   }
 
   rt::Sleep(1 * rt::kSeconds);
@@ -346,9 +397,10 @@ void SteadyStateExperiment(double offered_rps) {
     std::mt19937 dg(rand());
     std::exponential_distribution<double> rd(
         1.0 / (1000000.0 / (offered_rps / static_cast<double>(threads))));
-    return GenerateWork(std::bind(rd, rg), 0, 2000000);
+    return GenerateWork(std::bind(rd, rg), 0, 1000000);
   });
 
+  flush_logs(w);
   PrintStatResults(w, offered_rps, rps);
 }
 
@@ -401,6 +453,8 @@ int main(int argc, char *argv[]) {
   }
 
   FillWriteRequestData();
+  std::remove(kLogFilePath);
+  write_logs_header();
 
   ret = runtime_init(argv[1], ClientHandler, NULL);
   if (ret) {
