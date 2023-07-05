@@ -8,9 +8,7 @@ INC += -I$(ROOT_PATH)/bindings/cc
 storage_server_src = storage_server.cc
 storage_server_obj = $(storage_server_src:.cc=.o)
 
-
-INC += -Isnappy/ -Isnappy/build/
-LIBS += snappy/build/libsnappy.a -lcrypto
+LIBS += -lcrypto
 
 src = $(storage_server_src)
 obj = $(src:.cc=.o)
