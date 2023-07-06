@@ -84,7 +84,8 @@ typedef struct __attribute__((__packed__)) {
   uint64_t tsc;
 } PacketHeader;
 
-constexpr char kLogFilePath[] = "/mydata/netbench.traces";
+constexpr char kLogFilePath[] = "/mydata/netbench.client.traces";
+constexpr char kLogFilePath2[] = "/mydata/netbench.client_nonetwork.traces";
 constexpr size_t kLogsMaxBufferEntries = 5 * 1000000;
 
 // The maximum lateness to tolerate before dropping egress samples.
@@ -105,36 +106,68 @@ struct work_unit {
   bool is_op_write;
   double start_us, work_us, duration_us;
   uint64_t start_tsc, end_tsc, tsc;
+  uint64_t lba;
+  uint64_t end_tsc_per_lba[LBA_COUNT];
+  uint64_t server_duration_us_per_lba[LBA_COUNT];
 };
+
+// Random number generator for picking an LBA.
+std::random_device lba_dev;
+std::mt19937 lba_rng(lba_dev());
+std::uniform_int_distribution<std::mt19937::result_type> lba_rnd(0, NUM_SECTORS);
+
 
 /* Flushes the buffered logs into a trace file.
  *
  * Note:
  * This is not thread-safe and must be called with a lock held.
  */
-void flush_logs(const std::vector<work_unit> work_units) {
+void flush_logs(const std::vector<work_unit>& work_units) {
   std::cout << "Flushing traces...\n";
 
   std::ofstream log_file;
   log_file.open(kLogFilePath, std::fstream::app);
 
-  // Flush to trace file if successfully opened.
-  if (log_file.is_open()) {
-    size_t flush_count = 0;
-    for (const auto& w : work_units) {
-      if (w.duration_us == 0) {
-  // Skip requests that did not complete.
-  continue;
-      }
-      log_file << w.start_tsc << "," << w.end_tsc << "," << w.is_op_write
-               << "\n";
-      flush_count++;
-    }
-    std::cout << "Traces flushed (" << flush_count << ")...\n";
-    log_file.close();
-  } else {
-    std::cerr << "Cannot open trace file for writing. Skipping...\n";
+  std::ofstream log_file_2;
+  log_file_2.open(kLogFilePath2, std::fstream::app);
+
+  if (!log_file.is_open()) {
+    std::cerr << "Cannot open trace file: " << kLogFilePath << "\n";
+    return;
   }
+
+  if (!log_file_2.is_open()) {
+    std::cerr << "Cannot open trace file: " << kLogFilePath2 << "\n";
+    log_file.close();
+    return;
+  }
+
+  // Flush to trace file if successfully opened.
+  size_t flush_count = 0;
+  for (const auto& w : work_units) {
+    uint64_t end_tsc = 0;
+    uint64_t server_duration_us = 0;
+    for (unsigned int i = 0; i < LBA_COUNT; i++) {
+      if (w.end_tsc_per_lba[i] > end_tsc) {
+        end_tsc = w.end_tsc_per_lba[i];
+      }
+      if (w.server_duration_us_per_lba[i] > server_duration_us) {
+        server_duration_us = w.server_duration_us_per_lba[i];
+      }
+    }
+    if (end_tsc == 0) {
+      // Skip requests that did not complete.
+      continue;
+    }
+    log_file << w.start_tsc << "," << end_tsc << "," << w.is_op_write
+             << "\n";
+    log_file_2 << 0 << "," << server_duration_us << "," << w.is_op_write
+             << "\n";
+    flush_count++;
+  }
+  std::cout << "Traces flushed (" << flush_count << ")...\n";
+  log_file.close();
+  log_file_2.close();
 }
 
 void write_logs_header() {
@@ -144,10 +177,17 @@ void write_logs_header() {
     log_file << "start_tsc,end_tsc,is_op_write\n";
     log_file.close();
   }
+  std::ofstream log_file_2;
+  log_file_2.open(kLogFilePath2, std::fstream::app);
+  if (log_file_2.is_open()) {
+    log_file_2 << "start_tsc,end_tsc,is_op_write\n";
+    log_file_2.close();
+  }
 }
 
 template <class Arrival>
 std::vector<work_unit> GenerateWork(Arrival a, double cur_us, double last_us) {
+  // Random number generator for picking a write percentage.
   std::random_device dev;
   std::mt19937 rng(dev());
   std::uniform_int_distribution<std::mt19937::result_type> rnd(0, 100);
@@ -157,7 +197,24 @@ std::vector<work_unit> GenerateWork(Arrival a, double cur_us, double last_us) {
     cur_us += a();
     const auto pct = rnd(rng);
     const bool is_op_write = pct <= write_pct;
-    w.emplace_back(work_unit{is_op_write, cur_us, 0, 0});
+
+    const uint64_t sector = (lba_rnd(lba_rng) % NUM_SECTORS);
+    const uint64_t lba = sector & LBA_ALIGNMENT;
+
+    work_unit work {
+      .is_op_write = is_op_write,
+      .start_us = cur_us,
+      .work_us = 0,
+      .duration_us = 0,
+      .start_tsc = 0,
+      .end_tsc = 0,
+      .tsc = 0,
+      .lba = lba
+    };
+    for (unsigned int i = 0; i < LBA_COUNT; i++) {
+      work.end_tsc_per_lba[i] = 0;
+    }
+    w.emplace_back(work);
   }
   return w;
 }
@@ -169,11 +226,6 @@ std::vector<work_unit> ClientWorker(
   std::vector<work_unit> w(wf());
   std::vector<time_point<steady_clock>> timings;
   timings.reserve(w.size());
-
-  // Random number generator for picking an LBA.
-  std::random_device dev;
-  std::mt19937 rng(dev());
-  std::uniform_int_distribution<std::mt19937::result_type> rnd(0, NUM_SECTORS);
 
   // Start the receiver threads.
   std::vector<rt::Thread> th;
@@ -194,7 +246,7 @@ std::vector<work_unit> ClientWorker(
         // Only if magic matches should we read the rest of the payload.
         if (rp.magic != REFLEX_MAGIC) {
           panic("magic does not match, received magic = %d", rp.magic);
-  }
+        }
 
 #ifdef DEBUG
         PrintPacketHeader(&rp);
@@ -212,13 +264,15 @@ std::vector<work_unit> ClientWorker(
         }
 
         barrier();
-        auto end_tsc = rdtsc();
-        auto ts = steady_clock::now();
+        auto end_tsc = microtime();
+        // auto ts = steady_clock::now();
         barrier();
         uint64_t idx = rp.req_handle;
-        w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
-        w[idx].tsc = ntoh64(rp.tsc);
-        w[idx].end_tsc = end_tsc;
+        // w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
+        // w[idx].tsc = ntoh64(rp.tsc);
+        const auto end_tsc_idx = (rp.lba - w[idx].lba) / SECTOR_SIZE;
+        w[idx].end_tsc_per_lba[end_tsc_idx] = end_tsc;
+        w[idx].server_duration_us_per_lba[end_tsc_idx] = rp.tsc;
       }
     }));
   }
@@ -238,39 +292,41 @@ std::vector<work_unit> ClientWorker(
   // size_t server_idx = 0;
 
   for (unsigned int i = 0; i < wsize; ++i) {
-    const uint64_t sector = (rnd(rng) % NUM_SECTORS);
-    uint64_t lba = sector & LBA_ALIGNMENT;
-    auto lba_count = LBA_COUNT;
-    if (lba + LBA_COUNT > NUM_SECTORS) {
-      lba_count = NUM_SECTORS - lba;
-    }
-
-    p.magic = REFLEX_MAGIC;
-    p.opcode = w[i].is_op_write ? OPCODE_SET : OPCODE_GET;
-    p.req_handle = static_cast<uint64_t>(i);
-    p.lba = lba;
-    p.lba_count = lba_count;
-    p.tsc = 0;
-    
     barrier();
     auto now = steady_clock::now();
     barrier();
-
-    // TODO girfan: round-robin
-    // rt::TcpConn *c = conns[server_idx].get();
-
-    // TODO girfan: lba striping across servers
-    rt::TcpConn *c = conns[sector % conns.size()].get();
-
     if (duration_cast<sec>(now - expstart).count() < w[i].start_us) {
-      w[i].start_tsc = rdtsc();
-      ssize_t ret = c->WriteFull(&p, sizeof(PacketHeader));
-      if (ret != static_cast<ssize_t>(sizeof(PacketHeader)))
-        panic("write failed, ret = %ld", ret);
-      if (w[i].is_op_write) {
-        ret = c->WriteFull(writeReqData.data(), lba_count * SECTOR_SIZE);
-        if (ret != static_cast<ssize_t>(lba_count * SECTOR_SIZE))
+      w[i].start_tsc = microtime();
+      for (unsigned int j = 0; j < LBA_COUNT; j++) {
+        p.magic = REFLEX_MAGIC;
+        p.opcode = w[i].is_op_write ? OPCODE_SET : OPCODE_GET;
+        p.req_handle = static_cast<uint64_t>(i);
+        p.lba = w[i].lba + (j * SECTOR_SIZE);
+        p.lba_count = 1; // Each request just operates on 1 lba
+        p.tsc = 0;
+
+        // This request is exceeding the sectors on the disk; skip
+        if (unlikely(p.lba > NUM_SECTORS)) {
+          break;
+        }
+
+        // TODO girfan: round-robin
+        // rt::TcpConn *c = conns[server_idx].get();
+
+        // TODO girfan: lba striping across servers
+        // rt::TcpConn *c = conns[sector % conns.size()].get();
+
+        // TODO girfan: lba stripes across each server
+        rt::TcpConn *c = conns[j % conns.size()].get();
+
+        ssize_t ret = c->WriteFull(&p, sizeof(PacketHeader));
+        if (ret != static_cast<ssize_t>(sizeof(PacketHeader)))
           panic("write failed, ret = %ld", ret);
+        if (w[i].is_op_write) {
+          ret = c->WriteFull(writeReqData.data(), p.lba_count * SECTOR_SIZE);
+          if (ret != static_cast<ssize_t>(p.lba_count * SECTOR_SIZE))
+            panic("write failed, ret = %ld", ret);
+        }
       }
       now = steady_clock::now();
       rt::Sleep(w[i].start_us - duration_cast<sec>(now - expstart).count());
@@ -278,14 +334,13 @@ std::vector<work_unit> ClientWorker(
     if (duration_cast<sec>(now - expstart).count() - w[i].start_us >
         kMaxCatchUpUS)
       continue;
-
     barrier();
     timings[i] = steady_clock::now();
     barrier();
-
-    // TODO girfan: round-robin
-    // server_idx = (server_idx + 1) % conns.size();
   }
+
+  // TODO girfan: round-robin
+  // server_idx = (server_idx + 1) % conns.size();
 
   rt::Sleep(1 * rt::kSeconds);
 
@@ -354,9 +409,11 @@ std::vector<work_unit> RunExperiment(
   }
 
   // Remove requests that did not complete.
+  /*
   w.erase(std::remove_if(w.begin(), w.end(),
                          [](const work_unit &s) { return s.duration_us == 0; }),
           w.end());
+  */
 
   double elapsed = duration_cast<sec>(finish - start).count();
   if (rps != nullptr)
@@ -454,6 +511,7 @@ int main(int argc, char *argv[]) {
 
   FillWriteRequestData();
   std::remove(kLogFilePath);
+  std::remove(kLogFilePath2);
   write_logs_header();
 
   ret = runtime_init(argv[1], ClientHandler, NULL);

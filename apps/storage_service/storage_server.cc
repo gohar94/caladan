@@ -82,27 +82,9 @@ void write_logs_header() {
 
 class SharedTcpStream {
  public:
-  SharedTcpStream(std::shared_ptr<rt::TcpConn> c) : c_(c) {
-    int ret;
+  SharedTcpStream(std::shared_ptr<rt::TcpConn> c) : c_(c) {}
 
-    preempt_disable();
-    aes_ctx_ = EVP_CIPHER_CTX_new();
-    preempt_enable();
-    if (!aes_ctx_)
-      throw std::bad_alloc();
-
-    memset(aes_key_, 0xcc, sizeof(aes_key_));
-    ret = EVP_EncryptInit_ex(aes_ctx_, EVP_aes_256_cbc(), NULL, aes_key_, iv);
-    if (ret != 1)
-      panic("AES init %d", ret);
-
-  }
-
-  ~SharedTcpStream() {
-    preempt_disable();
-    EVP_CIPHER_CTX_free(aes_ctx_);
-    preempt_enable();
-  }
+  ~SharedTcpStream() {}
 
   ssize_t WriteFull(const void *buf, size_t len) {
     rt::ScopedLock<rt::Mutex> lock(&sendMutex);
@@ -111,20 +93,6 @@ class SharedTcpStream {
   ssize_t WritevFull(const struct iovec *iov, int iovcnt) {
     rt::ScopedLock<rt::Mutex> lock(&sendMutex);
     return WritevFullLocked(iov, iovcnt);
-  }
-
-  ssize_t EncryptStream(char *plaintext, size_t size, char *ciphertext) {
-    int ret;
-    int len;
-
-    if (size % 16 != 0)
-      return -EINVAL;
-
-    ret = EVP_EncryptUpdate(aes_ctx_, (unsigned char *)ciphertext, &len, (unsigned char *)plaintext, size);
-    if (ret != 1)
-      return -EINVAL;
-
-    return len;
   }
 
   ssize_t WritevFullLocked(const struct iovec *iov, int iovcnt) {
@@ -151,8 +119,6 @@ class SharedTcpStream {
 
   rt::Mutex sendMutex;
  private:
-  EVP_CIPHER_CTX *aes_ctx_;
-  unsigned char aes_key_[32];
   std::shared_ptr<rt::TcpConn> c_;
 };
 
@@ -212,7 +178,7 @@ static void DoRequest(RequestContext *ctx, char *read_buf, const size_t idx) {
   barrier();
 
   size_t buf_length = ctx->header.lba_count * kSectorSize;
-  ctx->header.tsc = rdtsc();
+  ctx->header.tsc = end_tsc - start_tsc;
   struct iovec response[2] = {
       {
           .iov_base = &ctx->header,
@@ -265,7 +231,7 @@ void HandleSetRequest(RequestContext *ctx, const size_t idx) {
   rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
   barrier();
 
-  ctx->header.tsc = rdtsc();
+  ctx->header.tsc = end_tsc - start_tsc;
   struct iovec response[1] = {
       {
           .iov_base = &ctx->header,
